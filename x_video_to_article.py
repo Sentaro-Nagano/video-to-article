@@ -63,16 +63,26 @@ OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs")
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
 
-def _groq_retry(fn, tries=4, base_wait=8):
-    """無料枠の一時的な混雑(429等)に備えた素朴なリトライ。確実性アップ用。"""
+def _groq_retry(fn, tries=8, base_wait=8):
+    """無料枠のリトライ。レート制限(429)は「あとX分待て」を読み取って長く待ち、
+    長尺動画(時間あたり7,200音声秒の上限超え)でも完走できるようにする。"""
     import time
     for i in range(tries):
         try:
             return fn()
-        except Exception:
+        except Exception as e:
             if i == tries - 1:
                 raise
-            time.sleep(base_wait * (i + 1))
+            msg = str(e)
+            is_rate_limit = "429" in msg or "rate_limit" in msg or "Rate limit" in msg
+            if is_rate_limit:
+                # Groqのエラー文 "Please try again in 12m34.5s" / "in 7.66s" から待ち時間を取得
+                m = re.search(r"try again in (?:(\d+)m)?([\d.]+)s", msg)
+                wait = (int(m.group(1) or 0) * 60 + float(m.group(2)) + 10) if m else 600
+                print(f"      レート制限: {wait:.0f}秒待って再開 ({i+1}/{tries})", file=sys.stderr)
+                time.sleep(wait)
+            else:
+                time.sleep(base_wait * (i + 1))
 
 
 def _run(cmd):
