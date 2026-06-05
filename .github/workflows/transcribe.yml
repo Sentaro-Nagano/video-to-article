@@ -1,0 +1,85 @@
+# 置き場所:  リポジトリ内の  .github/workflows/transcribe.yml
+#
+# やること: URLを受け取る → 動画をmp3化 → Groq Whisperで文字起こし → 記事化
+#           → outputs/ にコミット(リポジトリに記事が残る)
+#
+# 起動方法は2つ:
+#   1) GitHubの「Actions」タブ → このワークフロー → Run workflow → URLを貼る
+#   2) スマホの共有ボタン等から repository_dispatch をPOST(下の説明参照)
+#
+# 必要なシークレット (Settings → Secrets and variables → Actions):
+#   GROQ_API_KEY   … 必須。console.groq.com で無料取得
+#   YTDLP_COOKIES  … 任意。X のログイン必須動画用に cookies.txt の中身を貼る
+#                    (公開リポジトリでも secret は秘匿されるので安全)
+
+name: video-to-article
+
+on:
+  workflow_dispatch:          # 手動 or API起動。URLを入力で受け取る
+    inputs:
+      url:
+        description: "動画URL (X / YouTube 等)"
+        required: true
+      lang:
+        description: "記事の言語 (ja / original)"
+        required: false
+        default: "ja"
+  repository_dispatch:        # スマホ共有などからのWebhook起動
+    types: [transcribe]
+
+permissions:
+  contents: write             # outputs/ をコミットするため
+
+# 同じURLを連投しても無駄な多重実行を防ぐ(無料分の節約)
+concurrency:
+  group: video-to-article
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 依存をインストール
+        run: |
+          sudo apt-get update && sudo apt-get install -y ffmpeg
+          pip install --upgrade yt-dlp groq
+
+      - name: cookies を用意 (任意・Xの確実性向上)
+        env:
+          YTDLP_COOKIES: ${{ secrets.YTDLP_COOKIES }}
+        run: |
+          if [ -n "$YTDLP_COOKIES" ]; then
+            printf '%s' "$YTDLP_COOKIES" > cookies.txt
+            echo "cookies.txt を作成しました"
+          fi
+
+      - name: 文字起こし＋記事化
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          COOKIES_FILE: cookies.txt
+          SRC_URL: ${{ github.event.inputs.url || github.event.client_payload.url }}
+          ART_LANG: ${{ github.event.inputs.lang || github.event.client_payload.lang || 'ja' }}
+        run: |
+          if [ -z "$SRC_URL" ]; then echo "URLが空です"; exit 1; fi
+          python x_video_to_article.py "$SRC_URL" --lang "$ART_LANG"
+
+      - name: 結果をコミット
+        run: |
+          git config user.name  "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add outputs/
+          git commit -m "article: ${{ github.event.inputs.url || github.event.client_payload.url }}" || echo "差分なし"
+          git push || echo "pushなし"
+
+      # ── 任意: Notion に直接入れたい場合は↓を有効化して既存コードに合わせて調整 ──
+      # - name: Notionへ送る (任意)
+      #   env:
+      #     NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+      #     NOTION_DB: ${{ secrets.NOTION_DB }}
+      #   run: python push_to_notion.py   # 既存のNotion追加処理をここで呼ぶ
