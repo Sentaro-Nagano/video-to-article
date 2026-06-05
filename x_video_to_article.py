@@ -74,6 +74,8 @@ def _groq_retry(fn, tries=8, base_wait=8):
             if i == tries - 1:
                 raise
             msg = str(e)
+            if "Request too large" in msg or "reduce your message size" in msg:
+                raise  # 1リクエストが大きすぎる(413)は待っても直らない
             is_rate_limit = "429" in msg or "rate_limit" in msg or "Rate limit" in msg
             if is_rate_limit:
                 # Groqのエラー文 "Please try again in 12m34.5s" / "in 7.66s" から待ち時間を取得
@@ -167,14 +169,57 @@ def make_notes(chunk_text, lang):
     return resp.choices[0].message.content.strip()
 
 
+# 無料枠のTPM(1分あたりトークン)上限に1リクエストを収めるための文字数上限。
+# 70B(=12,000 TPM)向けの最終統合と、8B(=6,000 TPM)向けの圧縮で別の値を使う。
+REDUCE_CHAR_LIMIT = 9000
+CONDENSE_CHAR_LIMIT = 5000
+
+
+def _condense(batch, title, lang):
+    """長尺動画でメモが多すぎるとき、複数メモを情報を保ったまま1つに圧縮(8B)。"""
+    lang_line = "日本語で" if lang == "ja" else "元の言語のまま"
+    joined = "\n\n".join(batch)
+    prompt = (
+        f"以下は動画『{title}』の連続したメモ群です。{lang_line}、重複を統合し、"
+        "重要な論点・手順・具体例を失わないよう1つのメモに圧縮してください。"
+        "コマンド・コード・固有名詞・数値はそのまま正確に残すこと。創作はしない。\n\n"
+        f"----\n{joined}\n----"
+    )
+    resp = _groq_retry(lambda: client.chat.completions.create(
+        model=NOTES_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
+    ))
+    return resp.choices[0].message.content.strip()
+
+
 def write_article(notes_list, title, lang):
     """reduce: 全チャンクのメモを統合して最終記事(markdown)に。
+
+    メモ全体が無料枠の1リクエスト上限を超える場合は、段階的に圧縮してから
+    最終統合する(hierarchical reduce)。
 
     既存の Claude ベース記事化を使いたい場合は、この関数の中身を
     既存関数の呼び出しに差し替えるだけでよい。
     """
     lang_line = "日本語で" if lang == "ja" else "動画の元言語で"
-    joined = "\n\n".join(f"## メモ {i+1}\n{n}" for i, n in enumerate(notes_list))
+    notes = list(notes_list)
+    while sum(len(n) for n in notes) > REDUCE_CHAR_LIMIT and len(notes) > 1:
+        print(f"      メモが大きいので圧縮します({len(notes)}個)", file=sys.stderr)
+        merged, batch, size = [], [], 0
+        for n in notes:
+            if batch and size + len(n) > CONDENSE_CHAR_LIMIT:
+                merged.append(_condense(batch, title, lang))
+                batch, size = [], 0
+            batch.append(n)
+            size += len(n)
+        if batch:
+            merged.append(_condense(batch, title, lang))
+        if len(merged) >= len(notes):
+            notes = merged
+            break  # 圧縮が進まない場合の無限ループ防止
+        notes = merged
+    joined = "\n\n".join(f"## メモ {i+1}\n{n}" for i, n in enumerate(notes))
     prompt = (
         f"あなたは技術記事の編集者です。次の各メモは1本の動画『{title}』を順に要約した"
         f"ものです。これらを統合し、{lang_line}、読みやすい長文記事(markdown)に再構成して"
@@ -212,6 +257,15 @@ def process(url, lang="ja"):
             print(f"      - {i+1}/{len(chunks)}", file=sys.stderr)
             parts.append(transcribe(c))
         transcript = "\n".join(p.strip() for p in parts if p.strip())
+
+        # 後段(記事化)で失敗しても文字起こしだけは回収できるよう、先に保存しておく
+        try:
+            os.makedirs(OUTPUT_DIR, exist_ok=True)
+            with open(os.path.join(OUTPUT_DIR, f"{_sanitize(title)}_transcript.txt"),
+                      "w", encoding="utf-8") as f:
+                f.write(transcript)
+        except OSError:
+            pass
 
         print("[4/4] 記事化(map→reduce)", file=sys.stderr)
         notes = [make_notes(p, lang) for p in parts if p.strip()]
